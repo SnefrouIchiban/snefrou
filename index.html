@@ -107,4 +107,209 @@
       </select>
     </div>
     <div class="loading" id="loading"><div class="spinner"></div><span class="loading-text" id="loading-text">Génération en cours…</span></div>
-    <div class="playlist-zone" id="playlist-zon
+    <div class="playlist-zone" id="playlist-zone">
+      <div class="playlist-header">
+        <input class="playlist-title-input" id="playlist-title" value="Ma playlist" />
+        <div class="pl-actions">
+          <button class="btn" onclick="copyList()">Copier</button>
+          <button class="btn spotify" onclick="createSpotifyPlaylist()">Créer sur Spotify</button>
+        </div>
+      </div>
+      <div class="track-list" id="track-list"></div>
+      <div class="playlist-footer"><span class="pl-stats" id="pl-stats"></span></div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const CLIENT_ID = 'cbdd9b0320874109a3640fe744b05c85';
+const REDIRECT_URI = 'https://snefrouichiban.github.io/snefrou';
+const SCOPES = 'playlist-modify-public playlist-modify-private';
+let tracks = [], spotifyToken = null, spotifyUserId = null;
+
+async function sha256(plain) {
+  const enc = new TextEncoder().encode(plain);
+  return crypto.subtle.digest('SHA-256', enc);
+}
+function base64urlencode(a) {
+  return btoa(String.fromCharCode(...new Uint8Array(a))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function generatePKCE() {
+  const verifier = base64urlencode(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = base64urlencode(await sha256(verifier));
+  return { verifier, challenge };
+}
+
+function loadConfig() {
+  document.getElementById('anthropic-key').value = localStorage.getItem('anthropic_key') || '';
+  const tok = localStorage.getItem('spotify_token');
+  const exp = localStorage.getItem('spotify_token_exp');
+  if (tok && exp && Date.now() < parseInt(exp)) {
+    spotifyToken = tok; spotifyUserId = localStorage.getItem('spotify_user_id') || null; setConnected(true);
+  }
+}
+
+function saveConfig() {
+  const key = document.getElementById('anthropic-key').value.trim();
+  if (key) localStorage.setItem('anthropic_key', key);
+  toast('Configuration sauvegardée', 'success');
+}
+
+function setConnected(yes) {
+  document.getElementById('auth-status').classList.toggle('connected', yes);
+  document.getElementById('auth-text').textContent = yes ? 'Connecté à Spotify' : 'Non connecté';
+}
+
+async function connectSpotify() {
+  const { verifier, challenge } = await generatePKCE();
+  localStorage.setItem('pkce_verifier', verifier);
+  const state = Math.random().toString(36).substring(2, 10);
+  const url = `https://accounts.spotify.com/authorize?response_type=code&client_id=${CLIENT_ID}&scope=${encodeURIComponent(SCOPES)}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&state=${state}&code_challenge=${challenge}&code_challenge_method=S256`;
+  window.location.href = url;
+}
+
+async function handleCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  const error = params.get('error');
+  if (error) { showBanner('Erreur Spotify : ' + error, 'error'); window.history.replaceState({}, document.title, window.location.pathname); return; }
+  if (!code) return;
+  const verifier = localStorage.getItem('pkce_verifier');
+  if (!verifier) { showBanner('Session expirée, reconnecte-toi.', 'error'); return; }
+  showBanner('Connexion en cours…', 'success');
+  try {
+    const res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI, client_id: CLIENT_ID, code_verifier: verifier })
+    });
+    const data = await res.json();
+    if (data.access_token) {
+      spotifyToken = data.access_token;
+      localStorage.setItem('spotify_token', spotifyToken);
+      localStorage.setItem('spotify_token_exp', Date.now() + data.expires_in * 1000);
+      localStorage.removeItem('pkce_verifier');
+      setConnected(true);
+      showBanner('Connecté à Spotify !', 'success');
+      window.history.replaceState({}, document.title, window.location.pathname);
+      await fetchUserId();
+    } else {
+      showBanner('Erreur : ' + (data.error_description || data.error), 'error');
+    }
+  } catch(e) { showBanner('Erreur réseau', 'error'); }
+}
+
+function showBanner(msg, type) {
+  const b = document.getElementById('banner');
+  b.textContent = msg; b.className = `banner visible ${type}`;
+  if (type === 'success') setTimeout(() => b.classList.remove('visible'), 5000);
+}
+
+async function fetchUserId() {
+  try {
+    const res = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${spotifyToken}` } });
+    const data = await res.json();
+    spotifyUserId = data.id; localStorage.setItem('spotify_user_id', spotifyUserId);
+  } catch(e) {}
+}
+
+async function generate() {
+  const prompt = document.getElementById('prompt').value.trim();
+  if (!prompt) { toast('Décris d\'abord ta playlist', 'error'); return; }
+  const apiKey = document.getElementById('anthropic-key').value.trim() || localStorage.getItem('anthropic_key');
+  if (!apiKey) { toast('Clé API Anthropic manquante', 'error'); return; }
+  const nb = document.getElementById('nb-tracks').value;
+  setLoading(true, 'Génération en cours…');
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-calls': 'true' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514', max_tokens: 2000,
+        system: `Tu es un expert musical qui crée des playlists Spotify précises. Génère exactement ${nb} titres. Réponds UNIQUEMENT avec un objet JSON valide, sans markdown ni backticks : {"playlist_title": "...", "tracks": [{"title": "...", "artist": "...", "duration": "3:45"}]}`,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    const data = await res.json();
+    const text = data.content?.find(b => b.type === 'text')?.text || '';
+    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    tracks = parsed.tracks || [];
+    document.getElementById('playlist-title').value = parsed.playlist_title || 'Ma playlist';
+    renderPlaylist();
+    document.getElementById('playlist-zone').classList.add('visible');
+    setLoading(false);
+  } catch(e) { setLoading(false); toast('Erreur génération. Vérifie ta clé API.', 'error'); }
+}
+
+function renderPlaylist() {
+  const list = document.getElementById('track-list');
+  list.innerHTML = '';
+  tracks.forEach((t, i) => {
+    const div = document.createElement('div');
+    div.className = 'track';
+    div.innerHTML = `<span class="num">${i+1}</span><div class="info"><div class="t">${t.title}</div><div class="a">${t.artist}</div></div><span class="dur">${t.duration||''}</span><button class="remove-btn" onclick="removeTrack(${i})">×</button>`;
+    list.appendChild(div);
+  });
+  const total = tracks.reduce((acc, t) => { const p = (t.duration||'0:00').split(':'); return acc + parseInt(p[0])*60 + parseInt(p[1]||0); }, 0);
+  const h = Math.floor(total/3600), m = Math.floor((total%3600)/60);
+  document.getElementById('pl-stats').textContent = `${tracks.length} titres · ~${h>0 ? h+'h'+String(m).padStart(2,'0') : m+' min'}`;
+}
+
+function removeTrack(i) { tracks.splice(i, 1); renderPlaylist(); }
+
+function copyList() {
+  const lines = [document.getElementById('playlist-title').value, ''];
+  tracks.forEach((t, i) => lines.push(`${i+1}. ${t.title} — ${t.artist}`));
+  navigator.clipboard.writeText(lines.join('\n')).then(() => toast('Copié !', 'success'));
+}
+
+async function createSpotifyPlaylist() {
+  if (!spotifyToken) { toast('Connecte-toi d\'abord à Spotify', 'error'); return; }
+  if (!spotifyUserId) await fetchUserId();
+  const title = document.getElementById('playlist-title').value;
+  setLoading(true, 'Création de la playlist…');
+  try {
+    const plRes = await fetch(`https://api.spotify.com/v1/users/${spotifyUserId}/playlists`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${spotifyToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: title, description: 'Généré par Snefrou', public: false })
+    });
+    const pl = await plRes.json();
+    setLoading(true, 'Recherche des titres…');
+    const uris = [];
+    for (const t of tracks) {
+      const q = encodeURIComponent(`track:${t.title} artist:${t.artist}`);
+      const sRes = await fetch(`https://api.spotify.com/v1/search?q=${q}&type=track&limit=1`, { headers: { Authorization: `Bearer ${spotifyToken}` } });
+      const sData = await sRes.json();
+      const uri = sData.tracks?.items?.[0]?.uri;
+      if (uri) uris.push(uri);
+    }
+    if (uris.length > 0) {
+      await fetch(`https://api.spotify.com/v1/playlists/${pl.id}/tracks`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${spotifyToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uris })
+      });
+    }
+    setLoading(false);
+    toast(`Playlist créée ! ${uris.length}/${tracks.length} titres ajoutés.`, 'success');
+  } catch(e) { setLoading(false); toast('Erreur Spotify', 'error'); }
+}
+
+function setLoading(on, msg) {
+  document.getElementById('loading').classList.toggle('visible', on);
+  if (msg) document.getElementById('loading-text').textContent = msg;
+  document.getElementById('gen-btn').disabled = on;
+}
+
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.className = `toast ${type||''} show`;
+  setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+loadConfig();
+handleCallback();
+</script>
+</body>
+</html>
